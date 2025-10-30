@@ -1,0 +1,19 @@
+dataset:
+  #target: dataset.motionbrain_revised.MotionbrainDataset_2
+  target: dataset.quality_degree.MotionbrainDataset_2
+  params:
+    # Path to the file list.
+    file_list: '/public_bme/data/lifeng/data/val_hcp.list' #'/public_bme/data/lifeng/data/val_hcp.list' #/home_data/home/lifeng2023/data/diffbir_data/val.list
+    out_size: 512 #512
+    #label_path: '/public_bme2/bme-wangqian2/lifeng2023/data/mic_extension/test_4class.xlsx'
+    # crop_type: center #none
+    # use_hflip: False
+
+data_loader:
+  batch_size: 20 #14,20 
+  shuffle: false #true
+  num_workers: 0
+  drop_last: true
+
+batch_transform:
+  target: dataset.batch_transform.IdentityBatchTransform

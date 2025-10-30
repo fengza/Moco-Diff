@@ -1,0 +1,54 @@
+target: model.quality_classification.QualityControl
+params:
+  lq_key: jpg
+  hq_key: hint
+  feat_dim: 1024
+  rout_path: 3
+  # Learning rate.
+  learning_rate: 1e-5 #1e-4
+  weight_decay: 0
+
+  quality_model_config:
+    target: model.quality_model.CLIP
+    params:
+      #use_checkpoint: True
+      feat_dim: 1024
+      #num_classes: 3
+      # num_img_classes: 2
+    
+  network_1_config:
+    target: model.swinir_ori.SwinIR
+    params:
+      img_size: 64
+      patch_size: 1
+      in_chans: 3 #3, revised:5
+      embed_dim: 180
+      depths: [6, 6, 6, 6, 6, 6, 6, 6]
+      num_heads: [6, 6, 6, 6, 6, 6, 6, 6]
+      window_size: 8
+      mlp_ratio: 2
+      sf: 8 #8 -> 4
+      img_range: 1.0
+      upsampler: "nearest+conv"
+      resi_connection: "1conv"
+      unshuffle: True
+      unshuffle_scale: 8 #8->4
+      #use_checkpoint: True
+
+  network_2_config:
+    target: model.swinir_dbt_plus.SwinIR
+    params:
+      img_size: 64
+      patch_size: 1
+      in_chans: 3 #3, revised:5
+      embed_dim: 180
+      depths: [6, 6, 6, 6, 6, 6, 6, 6]
+      num_heads: [6, 6, 6, 6, 6, 6, 6, 6]
+      window_size: 8
+      mlp_ratio: 2
+      sf: 8 #8 -> 4
+      img_range: 1.0
+      upsampler: "nearest+conv"
+      resi_connection: "1conv"
+      unshuffle: True
+      unshuffle_scale: 8 #8->4

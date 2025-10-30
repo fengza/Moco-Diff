@@ -1,0 +1,65 @@
+data:
+  target: dataset.data_module.BIRDataModule
+  params:
+    # Path to training set configuration file.
+    train_config: /public_bme/data/lifeng/code/moco/TS_BHIR/configs/dataset/brainT1_train.yaml
+    # Path to validation set configuration file.
+    val_config: /public_bme/data/lifeng/code/moco/TS_BHIR/configs/dataset/brainT1_val.yaml
+
+model:
+  # You can set learning rate in the following configuration file.
+  config: /public_bme/data/lifeng/code/moco/TS_BHIR/configs/model/class.yaml
+  # Path to the checkpoints or weights you want to resume.
+  resume: ~
+  network_1_resume: /public_bme/data/lifeng/code/moco/DiffBIR-main/checkpoints/lightning_logs/version_1386969/checkpoints/step=5699.ckpt
+  network_2_resume: /public_bme/data/lifeng/code/moco/DiffBIR-main/checkpoints_imgrouting/lightning_logs/version_2894049/checkpoints/step=1303.ckpt
+  #/public_bme2/bme-wangqian2/lifeng2023/data/mic_extension/swinir_512_axis/dbt_plus_checkpoints/lightning_logs/version_2978852/checkpoints/step=249.ckpt
+  #/public_bme2/bme-wangqian2/lifeng2023/data/mic_extension/swinir_512_axis/checkpoints_new/lightning_logs/version_2977616/checkpoints/step=19.ckpt
+  #/public_bme2/bme-wangqian2/lifeng2023/data/mic_extension/swinir_256_axis/checkpoints/lightning_logs/version_2968153/checkpoints/step=2359.ckpt
+  #/public_bme2/bme-wangqian2/lifeng2023/data/mic_extension/swinir_256_axis/checkpoints/lightning_logs/version_2968153/checkpoints/step=119.ckpt
+  #/public_bme/data/lifeng/code/moco/DiffBIR-main/checkpoints/lightning_logs/version_1386969/checkpoints/step=5699.ckpt
+  #/public_bme/data/lifeng/data/moco/mic_extension/swinir_256_axis/checkpoints/lightning_logs/version_2961272/checkpoints/step=399.ckpt
+  #/public_bme/data/lifeng/code/moco/TS_BHIR/checkpoints/lightning_logs/version_1410948/checkpoints/step=449.ckpt  #hcp, pre-trained DBT
+  #/public_bme/data/lifeng/code/moco/TS_BHIR/checkpoints/lightning_logs/version_1386969/checkpoints/step=99.ckpt
+  #/public_bme/data/lifeng/code/moco/TS_BHIR/checkpoints/lightning_logs/version_1390169/checkpoints/step=349.ckpt
+  #/public_bme/data/lifeng/code/moco/DiffBIR-main/checkpoints/lightning_logs/version_1386969/checkpoints/step=5699.ckpt  #hcp trained swinir
+  #/public_bme/data/lifeng/code/moco/DiffBIR-main/checkpoints/lightning_logs/version_1357626/checkpoints/step=949.ckpt #bcp trained swinir
+  #/home_data/home/lifeng2023/code/moco/DiffBIR-main/checkpoints/lightning_logs/version_1321170/checkpoints/step=49.ckpt 
+  #/home_data/home/lifeng2023/code/moco/DiffBIR-main/checkpoints/general_swinir_v1.ckpt
+  # reload_quality: True
+  quality_resume: /public_bme/data/lifeng/code/moco/ReIQA-main/mobrain_clip_weight/MoCov2_resnet50_RGB_Jig_False_moco_aug_B_mlp_0.2_cosine/ckpt_epoch_5.pth
+
+lightning:
+  seed: 231
+  
+  trainer:
+    accelerator: ddp
+    precision: 32
+    # Indices of GPUs used for training.
+    gpus: [0]
+    # Path to save logs and checkpoints.
+    default_root_dir: /public_bme2/bme-wangqian2/lifeng2023/data/mic_extension/swinir_512_axis/quality_classification_checkpoints
+    #/public_bme2/bme-wangqian2/lifeng2023/data/mic_extension/swinir_512_axis/dbt_checkpoints
+    # Max number of training steps (batches).
+    max_steps: 150001
+    # Validation frequency in terms of training steps.
+    val_check_interval: 3.0 #15.0 #4.0 #2.0(sag) #500
+    # Log frequency of tensorboard logger.
+    log_every_n_steps: 30 #50
+    # Accumulate gradients from multiple batches so as to increase batch size.
+    accumulate_grad_batches: 1
+  
+  callbacks:
+    - target: model.callbacks.ImageLogger
+      params:
+        # Log frequency of image logger.
+        log_every_n_steps: 10 #1000
+        max_images_each_step: 1 #4
+        log_images_kwargs: ~
+
+    - target: model.callbacks.ModelCheckpoint
+      params:
+        # Frequency of saving checkpoints.
+        every_n_train_steps: 100 #10000
+        save_top_k: -1
+        filename: "{step}"
