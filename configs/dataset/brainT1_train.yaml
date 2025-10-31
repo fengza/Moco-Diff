@@ -5,11 +5,12 @@ dataset:
     # Path to the file list.
     file_list: '/public_bme/data/lifeng/data/train_hcp.list' #'/public_bme/data/lifeng/data/train_hcp.list' #/home_data/home/lifeng2023/data/diffbir_data/train.list
     out_size: 512 #512
-    crop_type: center
+    #label_path: '/public_bme2/bme-wangqian2/lifeng2023/data/mic_extension/train_4class.xlsx'
+    # crop_type: center
     # use_hflip: False
 
 data_loader:
-  batch_size: 40 
+  batch_size: 40 #14,20,40
   shuffle: true
   num_workers: 4
   drop_last: true

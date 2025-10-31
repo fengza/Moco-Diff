@@ -32,7 +32,7 @@ params:
       upsampler: "nearest+conv"
       resi_connection: "1conv"
       unshuffle: True
-      unshuffle_scale: 8 
+      unshuffle_scale: 8 #8->4
       #use_checkpoint: True
 
   network_2_config:

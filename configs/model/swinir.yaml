@@ -1,4 +1,4 @@
-target: model.swinir_ori.SwinIR  #swinir_dbt_plus
+target: model.swinir_dbt.SwinIR  #swinir_dbt_plus
 params:
   img_size: 64
   patch_size: 1
@@ -22,12 +22,5 @@ params:
   learning_rate: 1e-6 #1e-4
   weight_decay: 0
 
-  # quality_model_config:
-  #   target: model.quality_model.CLIP
-  #   params:
-  #     #use_checkpoint: True
-  #     feat_dim: 1024
-  #     num_classes: 3
-  #     num_img_classes: 2
 
   

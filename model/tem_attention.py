@@ -1,0 +1,862 @@
+import os
+import warnings
+import math
+import torch
+import torch.nn as nn
+import torchvision
+import torch.nn.functional as F
+import torch.utils.checkpoint as checkpoint
+from distutils.version import LooseVersion
+from torch.nn.modules.utils import _pair, _single
+import numpy as np
+from functools import reduce, lru_cache
+from operator import mul
+from einops import rearrange
+from einops.layers.torch import Rearrange
+
+def window_partition(x, window_size):
+    """ Partition the input into windows. Attention will be conducted within the windows.
+
+    Args:
+        x: (B, D, H, W, C)
+        window_size (tuple[int]): window size
+
+    Returns:
+        windows: (B*num_windows, window_size*window_size, C)
+    """
+    B, D, H, W, C = x.shape
+    x = x.view(B, D // window_size[0], window_size[0], H // window_size[1], window_size[1], W // window_size[2],
+               window_size[2], C)
+    windows = x.permute(0, 1, 3, 5, 2, 4, 6, 7).contiguous().view(-1, reduce(mul, window_size), C)
+
+    return windows
+
+
+def window_reverse(windows, window_size, B, D, H, W):
+    """ Reverse windows back to the original input. Attention was conducted within the windows.
+
+    Args:
+        windows: (B*num_windows, window_size, window_size, C)
+        window_size (tuple[int]): Window size
+        H (int): Height of image
+        W (int): Width of image
+
+    Returns:
+        x: (B, D, H, W, C)
+    """
+    x = windows.view(B, D // window_size[0], H // window_size[1], W // window_size[2], window_size[0], window_size[1],
+                     window_size[2], -1)
+    x = x.permute(0, 1, 4, 2, 5, 3, 6, 7).contiguous().view(B, D, H, W, -1)
+
+    return x
+
+
+def get_window_size(x_size, window_size, shift_size=None):
+    """ Get the window size and the shift size """
+
+    use_window_size = list(window_size)
+    if shift_size is not None:
+        use_shift_size = list(shift_size)
+    for i in range(len(x_size)):
+        if x_size[i] <= window_size[i]:
+            use_window_size[i] = x_size[i]
+            if shift_size is not None:
+                use_shift_size[i] = 0
+
+    if shift_size is None:
+        return tuple(use_window_size)
+    else:
+        return tuple(use_window_size), tuple(use_shift_size)
+
+
+@lru_cache()
+def compute_mask(D, H, W, window_size, shift_size, device):
+    """ Compute attnetion mask for input of size (D, H, W). @lru_cache caches each stage results. """
+
+    img_mask = torch.zeros((1, D, H, W, 1), device=device)  # 1 Dp Hp Wp 1
+    cnt = 0
+    for d in slice(-window_size[0]), slice(-window_size[0], -shift_size[0]), slice(-shift_size[0], None):
+        for h in slice(-window_size[1]), slice(-window_size[1], -shift_size[1]), slice(-shift_size[1], None):
+            for w in slice(-window_size[2]), slice(-window_size[2], -shift_size[2]), slice(-shift_size[2], None):
+                img_mask[:, d, h, w, :] = cnt
+                cnt += 1
+    mask_windows = window_partition(img_mask, window_size)  # nW, ws[0]*ws[1]*ws[2], 1
+    mask_windows = mask_windows.squeeze(-1)  # nW, ws[0]*ws[1]*ws[2]
+    attn_mask = mask_windows.unsqueeze(1) - mask_windows.unsqueeze(2)  #[3861, 128, 128]
+    attn_mask = attn_mask.masked_fill(attn_mask != 0, float(-100.0)).masked_fill(attn_mask == 0, float(0.0))  #[3861, 128, 128],[192, 128, 128]
+
+    return attn_mask
+
+class Mlp_GEGLU(nn.Module):
+    """ Multilayer perceptron with gated linear unit (GEGLU). Ref. "GLU Variants Improve Transformer".
+
+    Args:
+        x: (B, D, H, W, C)
+
+    Returns:
+        x: (B, D, H, W, C)
+    """
+
+    def __init__(self, in_features, hidden_features=None, out_features=None, act_layer=nn.GELU, drop=0.):
+        super().__init__()
+        out_features = out_features or in_features
+        hidden_features = hidden_features or in_features
+
+        self.fc11 = nn.Linear(in_features, hidden_features)
+        self.fc12 = nn.Linear(in_features, hidden_features)
+        self.act = act_layer()
+        self.fc2 = nn.Linear(hidden_features, out_features)
+        self.drop = nn.Dropout(drop)
+
+    def forward(self, x):
+        x = self.act(self.fc11(x)) * self.fc12(x)
+        x = self.drop(x)
+        x = self.fc2(x)
+
+        return x
+
+def _no_grad_trunc_normal_(tensor, mean, std, a, b):
+    # From: https://github.com/rwightman/pytorch-image-models/blob/master/timm/models/layers/weight_init.py
+    # Cut & paste from PyTorch official master until it's in a few official releases - RW
+    # Method based on https://people.sc.fsu.edu/~jburkardt/presentations/truncated_normal.pdf
+    def norm_cdf(x):
+        # Computes standard normal cumulative distribution function
+        return (1. + math.erf(x / math.sqrt(2.))) / 2.
+
+    if (mean < a - 2 * std) or (mean > b + 2 * std):
+        warnings.warn(
+            'mean is more than 2 std from [a, b] in nn.init.trunc_normal_. '
+            'The distribution of values may be incorrect.',
+            stacklevel=2)
+
+    with torch.no_grad():
+        # Values are generated by using a truncated uniform distribution and
+        # then using the inverse CDF for the normal distribution.
+        # Get upper and lower cdf values
+        low = norm_cdf((a - mean) / std)
+        up = norm_cdf((b - mean) / std)
+
+        # Uniformly fill tensor with values from [low, up], then translate to
+        # [2l-1, 2u-1].
+        tensor.uniform_(2 * low - 1, 2 * up - 1)
+
+        # Use inverse cdf transform for normal distribution to get truncated
+        # standard normal
+        tensor.erfinv_()
+
+        # Transform to proper mean, std
+        tensor.mul_(std * math.sqrt(2.))
+        tensor.add_(mean)
+
+        # Clamp to ensure it's in the proper range
+        tensor.clamp_(min=a, max=b)
+        return tensor
+
+def trunc_normal_(tensor, mean=0., std=1., a=-2., b=2.):
+    r"""Fills the input Tensor with values drawn from a truncated
+    normal distribution.
+
+    From: https://github.com/rwightman/pytorch-image-models/blob/master/timm/models/layers/weight_init.py
+
+    The values are effectively drawn from the
+    normal distribution :math:`\mathcal{N}(\text{mean}, \text{std}^2)`
+    with values outside :math:`[a, b]` redrawn until they are within
+    the bounds. The method used for generating the random values works
+    best when :math:`a \leq \text{mean} \leq b`.
+
+    Args:
+        tensor: an n-dimensional `torch.Tensor`
+        mean: the mean of the normal distribution
+        std: the standard deviation of the normal distribution
+        a: the minimum cutoff value
+        b: the maximum cutoff value
+
+    Examples:
+        >>> w = torch.empty(3, 5)
+        >>> nn.init.trunc_normal_(w)
+    """
+    return _no_grad_trunc_normal_(tensor, mean, std, a, b)
+
+
+def drop_path(x, drop_prob: float = 0., training: bool = False):
+    """Drop paths (Stochastic Depth) per sample (when applied in main path of residual blocks).
+    From: https://github.com/rwightman/pytorch-image-models/blob/master/timm/models/layers/drop.py
+    """
+    if drop_prob == 0. or not training:
+        return x
+    keep_prob = 1 - drop_prob
+    shape = (x.shape[0], ) + (1, ) * (x.ndim - 1)  # work with diff dim tensors, not just 2D ConvNets
+    random_tensor = keep_prob + torch.rand(shape, dtype=x.dtype, device=x.device)
+    random_tensor.floor_()  # binarize
+    output = x.div(keep_prob) * random_tensor
+    return output
+
+
+class DropPath(nn.Module):
+    """Drop paths (Stochastic Depth) per sample  (when applied in main path of residual blocks).
+    From: https://github.com/rwightman/pytorch-image-models/blob/master/timm/models/layers/drop.py
+    """
+
+    def __init__(self, drop_prob=None):
+        super(DropPath, self).__init__()
+        self.drop_prob = drop_prob
+
+    def forward(self, x):
+        return drop_path(x, self.drop_prob, self.training)
+
+class WindowAttention(nn.Module):
+    """ Window based multi-head mutual attention and self attention.
+
+    Args:
+        dim (int): Number of input channels.
+        window_size (tuple[int]): The temporal length, height and width of the window.
+        num_heads (int): Number of attention heads.
+        qkv_bias (bool, optional):  If True, add a learnable bias to query, key, value. Default: True
+        qk_scale (float | None, optional): Override default qk scale of head_dim ** -0.5 if set
+        mut_attn (bool): If True, add mutual attention to the module. Default: True
+    """
+
+    def __init__(self, dim, window_size, num_heads, qkv_bias=False, qk_scale=None, mut_attn=True):
+        super().__init__()
+        self.dim = dim
+        self.window_size = window_size
+        self.num_heads = num_heads
+        head_dim = dim // num_heads
+        self.scale = qk_scale or head_dim ** -0.5
+        self.mut_attn = mut_attn
+
+        # self attention with relative position bias
+        self.relative_position_bias_table = nn.Parameter(
+            torch.zeros((2 * window_size[0] - 1) * (2 * window_size[1] - 1) * (2 * window_size[2] - 1),
+                        num_heads))  # 2*Wd-1 * 2*Wh-1 * 2*Ww-1, nH
+        self.register_buffer("relative_position_index", self.get_position_index(window_size))
+        self.qkv_self = nn.Linear(dim, dim * 3, bias=qkv_bias)
+        
+
+        # mutual attention with sine position encoding
+        if self.mut_attn:
+            self.register_buffer("position_bias",
+                                 self.get_sine_position_encoding(window_size[1:], dim // 2, normalize=True))
+            self.qkv_mut = nn.Linear(dim, dim * 3, bias=qkv_bias)
+            self.proj = nn.Linear(2 * dim, dim)
+        else:
+            self.proj = nn.Linear(dim, dim)
+
+        self.softmax = nn.Softmax(dim=-1)
+        trunc_normal_(self.relative_position_bias_table, std=.02)
+
+    def forward(self, x, mask=None):  #[3861, 128, 96]
+        """ Forward function.
+
+        Args:
+            x: input features with shape of (num_windows*B, N, C)
+            mask: (0/-inf) mask with shape of (num_windows, N, N) or None
+        """
+
+        # self attention
+        B_, N, C = x.shape
+        qkv = self.qkv_self(x).reshape(B_, N, 3, self.num_heads, C // self.num_heads).permute(2, 0, 3, 1, 4)  #[3, 3861, 6, 128, 16]
+        q, k, v = qkv[0], qkv[1], qkv[2]  # B_, nH, N, C   , [3861, 6, 128, 16]
+        x_out = self.attention(q, k, v, mask, (B_, N, C), relative_position_encoding=True)  #[3861, 128, 96]
+
+        # mutual attention
+        if self.mut_attn:
+            qkv = self.qkv_mut(x + self.position_bias.repeat(1, 2, 1)).reshape(B_, N, 3, self.num_heads,
+                                                                               C // self.num_heads).permute(2, 0, 3, 1,
+                                                                                                            4)
+            (q1, q2), (k1, k2), (v1, v2) = torch.chunk(qkv[0], 2, dim=2), torch.chunk(qkv[1], 2, dim=2), torch.chunk(
+                qkv[2], 2, dim=2)  # B_, nH, N/2, C
+            x1_aligned = self.attention(q2, k1, v1, mask, (B_, N // 2, C), relative_position_encoding=False)
+            x2_aligned = self.attention(q1, k2, v2, mask, (B_, N // 2, C), relative_position_encoding=False)
+            x_out = torch.cat([torch.cat([x1_aligned, x2_aligned], 1), x_out], 2)   #[3861, 128, 128]
+
+        # projection
+        x = self.proj(x_out)  #[3861, 128, 96]
+
+        return x
+
+    def attention(self, q, k, v, mask, x_shape, relative_position_encoding=True):
+        B_, N, C = x_shape
+        attn = (q * self.scale) @ k.transpose(-2, -1)
+
+        if relative_position_encoding:
+            relative_position_bias = self.relative_position_bias_table[
+                self.relative_position_index[:N, :N].reshape(-1)].reshape(N, N, -1)  # Wd*Wh*Ww, Wd*Wh*Ww,nH
+            attn = attn + relative_position_bias.permute(2, 0, 1).unsqueeze(0)  # B_, nH, N, N
+
+        if mask is None:
+            attn = self.softmax(attn)
+        else:
+            nW = mask.shape[0]
+            attn = attn.view(B_ // nW, nW, self.num_heads, N, N) + mask[:, :N, :N].unsqueeze(1).unsqueeze(0)
+            attn = attn.view(-1, self.num_heads, N, N)
+            attn = self.softmax(attn)
+
+        x = (attn @ v).transpose(1, 2).reshape(B_, N, C)
+
+        return x
+
+    def get_position_index(self, window_size):
+        ''' Get pair-wise relative position index for each token inside the window. '''
+
+        coords_d = torch.arange(window_size[0])
+        coords_h = torch.arange(window_size[1])
+        coords_w = torch.arange(window_size[2])
+        coords = torch.stack(torch.meshgrid(coords_d, coords_h, coords_w))  # 3, Wd, Wh, Ww
+        coords_flatten = torch.flatten(coords, 1)  # 3, Wd*Wh*Ww
+        relative_coords = coords_flatten[:, :, None] - coords_flatten[:, None, :]  # 3, Wd*Wh*Ww, Wd*Wh*Ww
+        relative_coords = relative_coords.permute(1, 2, 0).contiguous()  # Wd*Wh*Ww, Wd*Wh*Ww, 3
+        relative_coords[:, :, 0] += window_size[0] - 1  # shift to start from 0
+        relative_coords[:, :, 1] += window_size[1] - 1
+        relative_coords[:, :, 2] += window_size[2] - 1
+
+        relative_coords[:, :, 0] *= (2 * window_size[1] - 1) * (2 * window_size[2] - 1)
+        relative_coords[:, :, 1] *= (2 * window_size[2] - 1)
+        relative_position_index = relative_coords.sum(-1)  # Wd*Wh*Ww, Wd*Wh*Ww
+
+        return relative_position_index
+
+    def get_sine_position_encoding(self, HW, num_pos_feats=64, temperature=10000, normalize=False, scale=None):
+        """ Get sine position encoding """
+
+        if scale is not None and normalize is False:
+            raise ValueError("normalize should be True if scale is passed")
+
+        if scale is None:
+            scale = 2 * math.pi
+
+        not_mask = torch.ones([1, HW[0], HW[1]])
+        y_embed = not_mask.cumsum(1, dtype=torch.float32)
+        x_embed = not_mask.cumsum(2, dtype=torch.float32)
+        if normalize:
+            eps = 1e-6
+            y_embed = y_embed / (y_embed[:, -1:, :] + eps) * scale
+            x_embed = x_embed / (x_embed[:, :, -1:] + eps) * scale
+
+        dim_t = torch.arange(num_pos_feats, dtype=torch.float32)
+        dim_t = temperature ** (2 * (dim_t // 2) / num_pos_feats)
+
+        # BxCxHxW
+        pos_x = x_embed[:, :, :, None] / dim_t
+        pos_y = y_embed[:, :, :, None] / dim_t
+        pos_x = torch.stack((pos_x[:, :, :, 0::2].sin(), pos_x[:, :, :, 1::2].cos()), dim=4).flatten(3)
+        pos_y = torch.stack((pos_y[:, :, :, 0::2].sin(), pos_y[:, :, :, 1::2].cos()), dim=4).flatten(3)
+        pos_embed = torch.cat((pos_y, pos_x), dim=3).permute(0, 3, 1, 2)
+
+        return pos_embed.flatten(2).permute(0, 2, 1).contiguous()
+
+class WindowAttention_key(WindowAttention):
+    def __init__(self,dim, num_heads,window_size=(1,8,8), qkv_bias=False, qk_scale=None, mut_attn=True): # dim, window_size, num_heads, qkv_bias=False, qk_scale=None, mut_attn=True
+        super(WindowAttention_key,self).__init__(dim, window_size, num_heads, qkv_bias=False, qk_scale=None, mut_attn=True)
+        self.num_heads = num_heads
+        self.window_size = window_size
+        self.dim = dim
+        self.qkv_self = nn.Linear(dim, dim * 2, bias=qkv_bias)   #这里扩展的维度需要继续确认
+        self.proj = nn.Linear(dim, dim)
+    
+    def forward(self, x, x_others, mask=None):#[3861, 128, 96], [B*64, 64, 180]
+        """ Forward function.
+
+        Args:
+            x: input features with shape of (num_windows*B, N, C)
+            mask: (0/-inf) mask with shape of (num_windows, N, N) or None
+        """
+        #qkv_self后，[B*64,64,360] ->[B*64,64,2,5,36] ->[2,B*64,5,64,36]
+        # self attention
+        B_, N, C = x.shape
+        q = x.reshape(B_,self.num_heads,N,C // self.num_heads)  #[B*64, 5, 64, 36]
+
+        B_, N, C = x_others.shape
+        kv = self.qkv_self(x_others).reshape(B_, N, 2, self.num_heads, C // self.num_heads).permute(2, 0, 3, 1, 4)  #[3, 3861, 6, 128, 16]
+        k, v = kv[0], kv[1]  # B_, nH, N, C   , [3861, 6, 128, 16], [B*64,5,64,36]
+        x_out = self.attention(q, k, v, mask, (B_, N, C), relative_position_encoding=True)  #[3861, 128, 96], [B*64, 64, 180]
+        # projection
+        x = self.proj(x_out)  #[3861, 128, 96]
+
+        return x
+
+
+class TMSA(nn.Module):
+    """ Temporal Mutual Self Attention (TMSA).
+
+    Args:
+        dim (int): Number of input channels.
+        input_resolution (tuple[int]): Input resolution.
+        num_heads (int): Number of attention heads.
+        window_size (tuple[int]): Window size.
+        shift_size (tuple[int]): Shift size for mutual and self attention.
+        mut_attn (bool): If True, use mutual and self attention. Default: True.
+        mlp_ratio (float): Ratio of mlp hidden dim to embedding dim.
+        qkv_bias (bool, optional): If True, add a learnable bias to query, key, value. Default: True.
+        qk_scale (float | None, optional): Override default qk scale of head_dim ** -0.5 if set.
+        drop_path (float, optional): Stochastic depth rate. Default: 0.0.
+        act_layer (nn.Module, optional): Activation layer. Default: nn.GELU.
+        norm_layer (nn.Module, optional): Normalization layer.  Default: nn.LayerNorm.
+        use_checkpoint_attn (bool): If True, use torch.checkpoint for attention modules. Default: False.
+        use_checkpoint_ffn (bool): If True, use torch.checkpoint for feed-forward modules. Default: False.
+    """
+
+    def __init__(self,
+                 dim,
+                 input_resolution,
+                 num_heads,
+                 window_size=(6, 8, 8),
+                 shift_size=(0, 0, 0),
+                 mut_attn=True,
+                 mlp_ratio=2.,
+                 qkv_bias=True,
+                 qk_scale=None,
+                 drop_path=0.,
+                 act_layer=nn.GELU,
+                 norm_layer=nn.LayerNorm,
+                 use_checkpoint_attn=False,
+                 use_checkpoint_ffn=False
+                 ):
+        super().__init__()
+        self.dim = dim
+        self.input_resolution = input_resolution
+        self.num_heads = num_heads
+        self.window_size = window_size
+        self.shift_size = shift_size
+        self.use_checkpoint_attn = use_checkpoint_attn
+        self.use_checkpoint_ffn = use_checkpoint_ffn
+
+        assert 0 <= self.shift_size[0] < self.window_size[0], "shift_size must in 0-window_size"
+        assert 0 <= self.shift_size[1] < self.window_size[1], "shift_size must in 0-window_size"
+        assert 0 <= self.shift_size[2] < self.window_size[2], "shift_size must in 0-window_size"
+
+        self.norm1 = norm_layer(dim)
+        self.attn = WindowAttention(dim, window_size=self.window_size, num_heads=num_heads, qkv_bias=qkv_bias,
+                                    qk_scale=qk_scale, mut_attn=mut_attn)
+        self.drop_path = DropPath(drop_path) if drop_path > 0. else nn.Identity()
+        self.norm2 = norm_layer(dim)
+        self.mlp = Mlp_GEGLU(in_features=dim, hidden_features=int(dim * mlp_ratio), act_layer=act_layer)
+
+    def forward_part1(self, x, mask_matrix): #[2, 6, 64, 64, 180],[192, 128, 128]
+        B, D, H, W, C = x.shape
+        window_size, shift_size = get_window_size((D, H, W), self.window_size, self.shift_size)
+
+        x = self.norm1(x) #[2, 6, 64, 64, 180]
+
+        # pad feature maps to multiples of window size
+        pad_l = pad_t = pad_d0 = 0
+        pad_d1 = (window_size[0] - D % window_size[0]) % window_size[0]
+        pad_b = (window_size[1] - H % window_size[1]) % window_size[1]
+        pad_r = (window_size[2] - W % window_size[2]) % window_size[2]
+        x = F.pad(x, (0, 0, pad_l, pad_r, pad_t, pad_b, pad_d0, pad_d1), mode='constant')
+
+        _, Dp, Hp, Wp, _ = x.shape
+        # cyclic shift
+        if any(i > 0 for i in shift_size):
+            shifted_x = torch.roll(x, shifts=(-shift_size[0], -shift_size[1], -shift_size[2]), dims=(1, 2, 3)) #[2, 6, 64, 64, 180]
+            attn_mask = mask_matrix
+        else:
+            shifted_x = x  #[2, 6, 64, 64, 180]
+            attn_mask = None
+
+        # partition windows
+        x_windows = window_partition(shifted_x, window_size)  # B*nW, Wd*Wh*Ww, C ->[384, 128, 180]
+
+        # attention / shifted attention
+        attn_windows = self.attn(x_windows, mask=attn_mask)  # B*nW, Wd*Wh*Ww, C
+
+        # merge windows
+        attn_windows = attn_windows.view(-1, *(window_size + (C,)))
+        shifted_x = window_reverse(attn_windows, window_size, B, Dp, Hp, Wp)  # B D' H' W' C
+
+        # reverse cyclic shift
+        if any(i > 0 for i in shift_size):
+            x = torch.roll(shifted_x, shifts=(shift_size[0], shift_size[1], shift_size[2]), dims=(1, 2, 3))
+        else:
+            x = shifted_x   #[2, 6, 64, 64, 180]
+
+        if pad_d1 > 0 or pad_r > 0 or pad_b > 0:
+            x = x[:, :D, :H, :W, :]
+
+        x = self.drop_path(x)
+        #x = x
+
+        return x    #[2, 6, 64, 64, 180]
+
+    def forward_part2(self, x):
+        return self.drop_path(self.mlp(self.norm2(x)))
+        #return self.mlp(self.norm2(x))
+
+    def forward(self, x, mask_matrix):  #x的维度：[2, 6, 64, 64, 180]；  mask的维度：[192, 128, 128]
+        """ Forward function.
+
+        Args:
+            x: Input feature, tensor size (B, D, H, W, C).
+            mask_matrix: Attention mask for cyclic shift.
+        """
+
+        # attention
+        if self.use_checkpoint_attn:
+            x = x + checkpoint.checkpoint(self.forward_part1, x, mask_matrix)
+        else:
+            x = x + self.forward_part1(x, mask_matrix)
+
+        # feed-forward
+        if self.use_checkpoint_ffn:
+            x = x + checkpoint.checkpoint(self.forward_part2, x)
+        else:
+            x = x + self.forward_part2(x)
+
+        return x   #[2, 6, 64, 64, 180]
+
+class TMSA_single(nn.Module):  #【B，180，6，64，64】
+    def __init__(self,
+                 dim,
+                 #input_resolution,
+                 num_heads,
+                 window_size,
+                #  mut_attn,
+                 mlp_ratio=2,
+                #  qkv_bias, qk_scale,
+                 act_layer=nn.GELU,
+                 drop_path=2.,
+                #  norm_layer,
+                #  use_checkpoint_attn,
+                #  use_checkpoint_ffn
+                 ):
+        super(TMSA_single, self).__init__()
+        self.window_size = window_size
+        self.dim = dim
+        self.num_heads = num_heads
+        self.drop_path = DropPath(drop_path) if drop_path > 0. else nn.Identity()
+        self.attn = WindowAttention_key(self.dim,self.num_heads)
+        self.linear = nn.Sequential(Rearrange('n c d h w -> n d h w c'),
+                                    nn.Linear(180, 36))
+        #nn.Linear(180, 36)  #需要换成变量，而不是指定数值
+        
+        self.reshape1 = nn.Sequential(Rearrange('n c d h w -> n d h w c'),
+                                    nn.LayerNorm(self.dim))
+        self.reshape2 = nn.Sequential(Rearrange('n c d h w -> n d h w c'),
+                                    nn.LayerNorm(self.dim),
+                                    Rearrange('n d h w c -> n c d h w'))
+        self.norm2 = nn.LayerNorm(dim)
+        self.mlp = Mlp_GEGLU(in_features=dim, hidden_features=int(dim * mlp_ratio), act_layer=act_layer)
+    
+    def forward(self,x):  #[2, 180, 6, 64, 64]
+        num_slices = x.shape[2]
+        key_index = num_slices // 2 - 1
+        indices = list(range(num_slices))
+        indices.pop(key_index)
+
+        x_key = x[:,:,key_index,...].unsqueeze(2)      #x:(B,C,D,H,W),[2, 180, 1, 64, 64] 
+        x_others = x[:,:,indices,...]     #[2, 180, 5, 64, 64]
+
+        # x_key = rearrange(x_key, 'b c d h w -> b d h w c')
+        # x_key = self.norm1(x_key) 
+        x_key = self.reshape1(x_key)  # n d h w c
+        x_others = self.reshape2(x_others)  #[2, 180, 1, 64, 64] 
+        # x_others = rearrange(x_others, 'b c d h w -> b d h w c')
+        # x_others = self.norm1(x_others)  #先分别过一个LayerNorm
+
+        #x_others = x_others.transpose(1,2)    #x_others:(B,C,D,H,W)
+        x_others_downsampled = self.linear(x_others) #.transpose(1,2) #x_others:(B,C,D,H,W), [B,36,5,64,64]
+
+        # x_key = x_key.transpose(-2, -1).transpose(-3,-2)  #x: (B, D, H, W, C),[B,1,64,64,180]
+        # rearrange(x_key, 'b c d h w -> b d h w c')
+       # x_others_downsampled = rearrange(x_others_downsampled, 'b c d h w -> b d h w c') #x: (B, D, H, W, C),[B,5,64,64,36]
+        #x_others_downsampled = x_others_downsampled.transpose(-2, -1).transpose(-3,-2)  
+        B,D,H,W,C = x_others_downsampled.shape #[B,5,64,64,36]
+        x_others_downsampled = x_others_downsampled.permute(0, 2, 3, 1, 4).contiguous().view(B,H,W,-1).unsqueeze(1)  #[B,64,64,180]->[B,1,64,64,180]
+        
+        x_windows = window_partition(x_key, self.window_size)  # B*nW, Wd*Wh*Ww, C, [B*64,64,180]
+        x_others_downsampled = window_partition(x_others_downsampled, self.window_size) #(B*64,64,180)
+        
+        # attention / shifted attention
+        attn_windows = self.attn(x_windows,x_others_downsampled, mask=None)  # B*nW, Wd*Wh*Ww, C
+
+        # merge windows
+        attn_windows = attn_windows.view(-1, *(self.window_size + (C,)))
+        shifted_x = window_reverse(attn_windows, self.window_size, B, 1, H, W)  # B D' H' W' C
+
+        # reverse cyclic shift
+        x = x_key + shifted_x    #TSA part 1
+
+        x = self.drop_path(x)
+        #x = x
+        x = x + self.drop_path(self.mlp(self.norm2(x)))     #TSA part 2
+        #x = x + self.mlp(self.norm2(x))
+
+        x = rearrange(x, 'b d h w c -> b c d h w')
+
+
+        return x   ##[B, 180, 1, 64, 64] ?
+
+class TMSAG(nn.Module):
+    """ Temporal Mutual Self Attention Group (TMSAG).
+
+    Args:
+        dim (int): Number of feature channels
+        input_resolution (tuple[int]): Input resolution.
+        depth (int): Depths of this stage.
+        num_heads (int): Number of attention head.
+        window_size (tuple[int]): Local window size. Default: (6,8,8).
+        shift_size (tuple[int]): Shift size for mutual and self attention. Default: None.
+        mut_attn (bool): If True, use mutual and self attention. Default: True.
+        mlp_ratio (float): Ratio of mlp hidden dim to embedding dim. Default: 2.
+        qkv_bias (bool, optional): If True, add a learnable bias to query, key, value. Default: True
+        qk_scale (float | None, optional): Override default qk scale of head_dim ** -0.5 if set.
+        drop_path (float | tuple[float], optional): Stochastic depth rate. Default: 0.0
+        norm_layer (nn.Module, optional): Normalization layer. Default: nn.LayerNorm
+        use_checkpoint_attn (bool): If True, use torch.checkpoint for attention modules. Default: False.
+        use_checkpoint_ffn (bool): If True, use torch.checkpoint for feed-forward modules. Default: False.
+    """
+
+    def __init__(self,
+                 dim,
+                 input_resolution,
+                 depth, #3
+                 num_heads,  # 6
+                 window_size=[6, 8, 8],
+                 shift_size=None,
+                 mut_attn=True,
+                 mlp_ratio=2.,
+                 qkv_bias=False,
+                 qk_scale=None,
+                 drop_path=0.,
+                 norm_layer=nn.LayerNorm,
+                 use_checkpoint_attn=False,
+                 use_checkpoint_ffn=False
+                 ):
+        super().__init__()
+        self.input_resolution = input_resolution  #(6, 192, 192), (6,64,64)
+        self.window_size = window_size  #(2,8,8)
+        self.shift_size = list(i // 2 for i in window_size) if shift_size is None else shift_size  #(1,4,4)
+
+        # build blocks, small window, [2, 8, 8]
+        self.blocks = nn.ModuleList([
+            TMSA(
+                dim=dim,
+                input_resolution=input_resolution,
+                num_heads=num_heads,
+                window_size=window_size,
+                shift_size=[0, 0, 0] if i % 2 == 0 else self.shift_size,
+                mut_attn=mut_attn,
+                mlp_ratio=mlp_ratio,
+                qkv_bias=qkv_bias,
+                qk_scale=qk_scale,
+                drop_path=drop_path[i] if isinstance(drop_path, list) else drop_path,
+                norm_layer=norm_layer,
+                use_checkpoint_attn=use_checkpoint_attn,
+                use_checkpoint_ffn=use_checkpoint_ffn
+            )
+            for i in range(depth)])
+
+
+
+
+    def forward(self, x):   #(B,180,6,64,64)
+        """ Forward function.
+
+        Args:
+            x: Input feature, tensor size (B, C, D, H, W).
+        """
+        #x = self.reshape(x)
+        # calculate attention mask for attention
+        B, C, D, H, W = x.shape
+        window_size, shift_size = get_window_size((D, H, W), self.window_size, self.shift_size)
+        x = rearrange(x, 'b c d h w -> b d h w c')  #[1, 6, 312, 264, 96] -> [B, 6, 64, 64, 180]
+        Dp = int(np.ceil(D / window_size[0])) * window_size[0]
+        Hp = int(np.ceil(H / window_size[1])) * window_size[1]
+        Wp = int(np.ceil(W / window_size[2])) * window_size[2]
+        attn_mask = compute_mask(Dp, Hp, Wp, window_size, shift_size, x.device)   #[3861, 128, 128] -> [192*B, 64, 64]?
+
+        for blk in self.blocks:
+            x = blk(x, attn_mask)
+
+        x = x.view(B, D, H, W, -1)  #[2, 6, 64, 64, 180]
+        x = rearrange(x, 'b d h w c -> b c d h w')
+
+        return x
+
+class TSA(nn.Module):
+    """ Residual Temporal Mutual Self Attention (RTMSA). Only used in stage 8.
+
+    Args:
+        dim (int): Number of input channels.
+        input_resolution (tuple[int]): Input resolution.
+        depth (int): Number of blocks.
+        num_heads (int): Number of attention heads.
+        window_size (int): Local window size.
+        mlp_ratio (float): Ratio of mlp hidden dim to embedding dim.
+        qkv_bias (bool, optional): If True, add a learnable bias to query, key, value. Default: True.
+        qk_scale (float | None, optional): Override default qk scale of head_dim ** -0.5 if set.
+        drop_path (float | tuple[float], optional): Stochastic depth rate. Default: 0.0.
+        norm_layer (nn.Module, optional): Normalization layer. Default: nn.LayerNorm.
+        use_checkpoint_attn (bool): If True, use torch.checkpoint for attention modules. Default: False.
+        use_checkpoint_ffn (bool): If True, use torch.checkpoint for feed-forward modules. Default: False.
+    """
+
+    def __init__(self,
+                 dim=180,
+                 input_resolution=(6,64,64),
+                 #depth,
+                 num_heads=5,
+                 window_size=(1,8,8),
+                 mlp_ratio=2.,
+                 qkv_bias=True,
+                 qk_scale=None,
+                 drop_path=0.,
+                 norm_layer=nn.LayerNorm,
+                 use_checkpoint_attn=False,
+                 use_checkpoint_ffn=None
+                 ):
+        super(TSA, self).__init__()
+        self.dim = dim
+        self.input_resolution = input_resolution
+
+        self.residual_group = TMSA_single(dim=dim,
+                                    #input_resolution=input_resolution,
+                                    #depth=depth,
+                                    num_heads=num_heads,
+                                    window_size=window_size,
+                                    # mut_attn=False,
+                                    mlp_ratio=mlp_ratio,
+                                    # qkv_bias=qkv_bias, qk_scale=qk_scale,
+                                    act_layer=nn.GELU,
+                                    drop_path=drop_path,
+                                    # norm_layer=norm_layer,
+                                    # use_checkpoint_attn=use_checkpoint_attn,
+                                    # use_checkpoint_ffn=use_checkpoint_ffn
+                                    )
+
+        self.linear = nn.Linear(dim, dim)
+
+    def forward(self, x):
+        return x + self.linear(self.residual_group(x).transpose(1, 4)).transpose(1, 4)
+
+class T_BMIR(nn.Module):
+    def __init__(self,
+                 in_dim=180,
+                 dim=180,
+                 input_resolution=[6,64,64],
+                 depth=[3,2],
+                 num_heads=6,
+                 window_size=(6,8,8),
+                 mul_attn_ratio=0.75,
+                 mlp_ratio=2.,
+                 qkv_bias=True,
+                 qk_scale=None,
+                 drop_path=0.,
+                 drop_path_rate = 0.2,
+                 norm_layer=nn.LayerNorm,
+                 reshape='none',
+                 use_checkpoint_attn=False,
+                 use_checkpoint_ffn=False
+                 ):
+        super(T_BMIR, self).__init__()
+
+        self.conv_first = nn.Conv3d(in_dim, dim, kernel_size=(1, 3, 3), padding=(0, 1, 1))
+
+        dpr = [x.item() for x in torch.linspace(0, drop_path_rate, sum(depth))]  # stochastic depth decay rule, 这是什么？？？？
+        # reshape the tensor
+        if reshape == 'none':
+            self.reshape = nn.Sequential(Rearrange('n c d h w -> n d h w c'),
+                                         nn.LayerNorm(dim),
+                                         Rearrange('n d h w c -> n c d h w'))
+        elif reshape == 'down':
+            self.reshape = nn.Sequential(Rearrange('n c d (h neih) (w neiw) -> n d h w (neiw neih c)', neih=2, neiw=2),
+                                         nn.LayerNorm(4 * in_dim), nn.Linear(4 * in_dim, dim),
+                                         Rearrange('n d h w c -> n c d h w'))
+        elif reshape == 'up':
+            self.reshape = nn.Sequential(Rearrange('n (neiw neih c) d h w -> n d (h neih) (w neiw) c', neih=2, neiw=2),
+                                         nn.LayerNorm(in_dim // 4), nn.Linear(in_dim // 4, dim),
+                                         Rearrange('n d h w c -> n c d h w'))
+
+        # mutual and self attention, small window
+        self.residual_group1 = TMSAG(dim=dim,
+                                     input_resolution=input_resolution,  #[6,64,64]
+                                     depth=3,#int(depth * mul_attn_ratio),
+                                     num_heads=num_heads,  #[6,...]
+                                     window_size=(2, window_size[1], window_size[2]),  #(2,8,8)
+                                     mut_attn=True,
+                                     mlp_ratio=mlp_ratio,
+                                     qkv_bias=qkv_bias,
+                                     qk_scale=qk_scale,
+                                     drop_path=drop_path,
+                                     norm_layer=norm_layer,
+                                     use_checkpoint_attn=use_checkpoint_attn,
+                                     use_checkpoint_ffn=use_checkpoint_ffn
+                                     )
+        self.linear1 = nn.Linear(dim, dim)
+
+        # large window
+        self.residual_group2 = TMSAG(dim=dim,
+                                     input_resolution=input_resolution,
+                                     depth=2, #depth - int(depth * mul_attn_ratio),
+                                     num_heads=num_heads,  #[6,...]
+                                     window_size=window_size,   #(6,8,8)
+                                     mut_attn=False,
+                                     mlp_ratio=mlp_ratio,
+                                     qkv_bias=qkv_bias, qk_scale=qk_scale,
+                                     drop_path=drop_path,
+                                     norm_layer=norm_layer,
+                                     use_checkpoint_attn=False,
+                                     use_checkpoint_ffn=use_checkpoint_ffn
+                                     )
+        self.linear2 = nn.Linear(dim, dim)
+        # only self attention
+        self.residual_group3 = TSA(dim=dim,
+                      input_resolution=input_resolution,
+                      #depth=depth,
+                      num_heads=5,
+                      window_size=(1, window_size[1], window_size[2]),
+                      mlp_ratio=mlp_ratio,
+                      qkv_bias=qkv_bias, qk_scale=qk_scale,
+                      #drop_path=dpr[sum(depths[:i]):sum(depths[:i + 1])],  #看下这里怎么用,好像是随机删去一些层？跟dropout感觉类似，避免过拟合？
+                      norm_layer=norm_layer
+                      )
+        
+        self.linear3 = nn.Linear(dim, dim)
+
+    def forward(self, x): #[2, 6, 180, 64, 64]
+        x = self.conv_first(x.transpose(1, 2))  #[2, 180, 6, 64, 64]
+        x = self.reshape(x) #[2, 180, 6, 64, 64]
+        x = self.linear1(self.residual_group1(x).transpose(1, 4)).transpose(1, 4) + x
+        x = self.linear2(self.residual_group2(x).transpose(1, 4)).transpose(1, 4) + x
+        x = self.linear3(self.residual_group3(x).transpose(1, 4)).transpose(1, 4) + x  #这里应该+x_key吧？
+
+        return x   #[B,180,6,64,64]   输出应该是单层吧？
+
+class SqEx(nn.Module):
+
+    def __init__(self, n_features, reduction=16):
+        super(SqEx, self).__init__()
+
+        if n_features % reduction != 0:
+            raise ValueError('n_features must be divisible by reduction (default = 16)')
+
+        self.linear1 = nn.Linear(n_features, n_features // reduction, bias=True)
+        self.nonlin1 = nn.ReLU(inplace=True)
+        self.linear2 = nn.Linear(n_features // reduction, n_features, bias=True)
+        self.nonlin2 = nn.Sigmoid()
+
+    def forward(self, x):
+
+        y = F.avg_pool2d(x, kernel_size=x.size()[2:4])
+        y = y.permute(0, 2, 3, 1)
+        y = self.nonlin1(self.linear1(y))
+        y = self.nonlin2(self.linear2(y))
+        y = y.permute(0, 3, 1, 2)
+        y = x * y
+        return y
+
+class Fusion_ST(nn.Module):
+    def __init__(self,dim=360,reduction=18):
+        super().__init__()
+        self.dim = dim
+        self.reduction = reduction
+        self.fusion = SqEx(self.dim,self.reduction)
+        self.conv1 = nn.Conv2d(dim, dim // 2, kernel_size=3, stride=1, padding=1, bias=False)
+
+    def forward(self,s,t):   #假定 s, t:[B,180,64,64],[2, 4096, 180],[2, 180, 6, 64, 64]
+        #fusion = torch.stack((s, t), dim=1)  #[B,360,64,64]
+        fusion = torch.cat([s,t], 1)
+        fusion = fusion + self.fusion(fusion)
+        fusion = self.conv1(fusion)   #[B, 180, 64, 64]
+
+        return fusion
