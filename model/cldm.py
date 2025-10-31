@@ -10,9 +10,7 @@ import os
 import numpy as np
 from model.cond_fn import MSEGuidance
 from utils.metrics import calculate_psnr_pt, LPIPS
-sys.path.append("/public_bme/data/lifeng/code/moco/DiffBIR-main")
-curPath_ = os.path.dirname(__file__)
-curPath = os.getcwd()
+
 
 from ldm.modules.diffusionmodules.util import (
     conv_nd,
@@ -304,9 +302,8 @@ class ControlLDM(LatentDiffusion):
     ) -> "ControlLDM":
         super().__init__(*args, **kwargs)
         # instantiate control module
-        self.control_model: ControlNet = instantiate_from_config(control_stage_config)    #新加的control model
-        # with open('/public_bme/data/lifeng/code/moco/DiffBIR-main/control_model_arch.txt','a') as file0:
-        #     print(self.control_model, file=file0)
+        self.control_model: ControlNet = instantiate_from_config(control_stage_config)    
+
         self.control_key = control_key
         self.sd_locked = sd_locked
         self.only_mid_control = only_mid_control
@@ -314,7 +311,7 @@ class ControlLDM(LatentDiffusion):
         self.control_scales = [1.0] * 13
         
         # instantiate preprocess module (SwinIR)
-        self.preprocess_model = instantiate_from_config(preprocess_config)              #新加的preprocess model (swinir)
+        self.preprocess_model = instantiate_from_config(preprocess_config)              
         frozen_module(self.preprocess_model)
         
         # instantiate condition encoder, since our condition encoder has the same 

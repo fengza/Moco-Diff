@@ -1,13 +1,6 @@
-# -----------------------------------------------------------------------------------
-# SwinIR: Image Restoration Using Swin Transformer, https://arxiv.org/abs/2108.10257
-# Originally Written by Ze Liu, Modified by Jingyun Liang.
-# -----------------------------------------------------------------------------------
-
-# Originally borrowed from DifFace (https://github.com/zsyOAOA/DifFace/blob/master/models/swinir.py)
 import sys
 import math
 from typing import Any, Dict, Set
-#sys.path.append("/home_data/home/lifeng2023/code/moco/DiffBIR-main/")
 
 import torch
 import torch.nn as nn
@@ -18,7 +11,7 @@ import pytorch_lightning as pl
 from pytorch_lightning.utilities.types import STEP_OUTPUT
 from timm.models.layers import DropPath, to_2tuple, trunc_normal_
 from einops import rearrange
-sys.path.append("/public_bme/data/lifeng/code/moco/MoCo-Diff")
+
 from utils.metrics import calculate_psnr_pt, LPIPS
 #from .mixins import ImageLoggerMixin
 from model.mixins import ImageLoggerMixin
